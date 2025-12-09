@@ -3,45 +3,93 @@ import "dotenv/config";
 
 /**
  * CONFIG
- * Env vars required:
- *  - POCKET_BASE_URL
- *  - EMAIL_HOST
+ *
+ * Supported env patterns:
+ *  - Single instance:
+ *      POCKET_BASE_URL
+ *      EMAIL_HOST
+ *
+ *  - Multiple instances:
+ *      POCKET_BASE_URL_1, EMAIL_HOST_1
+ *      POCKET_BASE_URL_2, EMAIL_HOST_2
+ *      ...
  */
-const { POCKET_BASE_URL, EMAIL_HOST } = process.env;
 
-if (!POCKET_BASE_URL || !EMAIL_HOST) {
-  console.error("Missing env vars. Required: POCKET_BASE_URL, EMAIL_HOST");
-  process.exit(1);
+function loadInstancesFromEnv() {
+  const instances = [];
+
+  // Base (non-suffixed) pair
+  if (process.env.POCKET_BASE_URL && process.env.EMAIL_HOST) {
+    instances.push({
+      name: "default",
+      baseUrl: process.env.POCKET_BASE_URL,
+      emailHost: process.env.EMAIL_HOST,
+    });
+  }
+
+  // Numbered pairs POCKET_BASE_URL_1 / EMAIL_HOST_1, etc.
+  for (let i = 1; i <= 20; i++) {
+    const url = process.env[`POCKET_BASE_URL_${i}`];
+    const host = process.env[`EMAIL_HOST_${i}`];
+    if (!url && !host) continue; // nothing defined for this index
+
+    if (!url || !host) {
+      console.warn(
+        `Skipping instance ${i} because one of POCKET_BASE_URL_${i} or EMAIL_HOST_${i} is missing.`
+      );
+      continue;
+    }
+
+    instances.push({
+      name: `instance_${i}`,
+      baseUrl: url,
+      emailHost: host,
+    });
+  }
+
+  if (instances.length === 0) {
+    console.error(
+      "No PocketBase instances configured. Define at least POCKET_BASE_URL and EMAIL_HOST, or numbered pairs."
+    );
+    process.exit(1);
+  }
+
+  return instances;
 }
 
-// Create shared PocketBase client
-const pb = new PocketBase(POCKET_BASE_URL);
-pb.autoCancellation(false);
+const INSTANCE_CONFIGS = loadInstancesFromEnv();
+
+/**
+ * Build runtime contexts: one PocketBase client per instance.
+ */
+const INSTANCE_CONTEXTS = INSTANCE_CONFIGS.map((cfg) => {
+  const pb = new PocketBase(cfg.baseUrl);
+  pb.autoCancellation(false);
+
+  return {
+    name: cfg.name,
+    baseUrl: cfg.baseUrl,
+    emailHost: cfg.emailHost,
+    pb,
+  };
+});
 
 /**
  * Email service: call external /update-document endpoint
- * This will be responsible for sending the email with a link that
- * ultimately points to /document-update/:id.
+ * (instance-aware via ctx)
  */
-async function sendExpiryEmail(doc, context) {
-  // Normalize EMAIL_HOST to avoid trailing slash issues
-  const baseUrl = EMAIL_HOST.replace(/\/+$/, "");
+async function sendExpiryEmail(ctx, doc, context) {
+  const baseUrl = ctx.emailHost.replace(/\/+$/, "");
   const url = `${baseUrl}/update-document`;
 
-  // Match the pattern your email server uses: req.body?.record || req.body
   const payload = {
     record: {
-      // REQUIRED: id of the original document so /document-update/:id can be built
       id: doc.id,
-
-      // Extra context if you want it on the email side
       name: doc.name,
       facility_id: doc.facility_id ?? doc.facility ?? null,
       client_id: doc.client_id ?? null,
       expire_date: doc.expire_date,
     },
-
-    // extra context (e.g. { reason: "expires_soon", daysUntil })
     ...context,
   };
 
@@ -62,27 +110,26 @@ async function sendExpiryEmail(doc, context) {
         /* ignore */
       }
       console.error(
-        `[EMAIL] /update-document responded with ${resp.status} ${resp.statusText}. Body: ${text}`
+        `[${ctx.name}][EMAIL] /update-document responded with ${resp.status} ${resp.statusText}. Body: ${text}`
       );
     } else {
       console.log(
-        `[EMAIL] Called /update-document for doc "${doc.name}" (id: ${doc.id})`
+        `[${ctx.name}][EMAIL] Called /update-document for doc "${doc.name}" (id: ${doc.id})`
       );
     }
   } catch (err) {
     console.error(
-      `[EMAIL] Failed to call /update-document for doc "${doc.name}" (id: ${doc.id}):`,
+      `[${ctx.name}][EMAIL] Failed to call /update-document for doc "${doc.name}" (id: ${doc.id}):`,
       err
     );
   }
 }
 
 /**
- * Email service for vendor doc issues
- * Calls external /vendor-docs-email on the email server.
+ * Email service for vendor doc issues (instance-aware)
  */
-async function sendVendorDocsEmail(vendor, context) {
-  const baseUrl = EMAIL_HOST.replace(/\/+$/, "");
+async function sendVendorDocsEmail(ctx, vendor, context) {
+  const baseUrl = ctx.emailHost.replace(/\/+$/, "");
   const url = `${baseUrl}/vendor-docs-email`;
 
   const payload = {
@@ -95,7 +142,7 @@ async function sendVendorDocsEmail(vendor, context) {
       coi_exp_date: vendor.coi_exp_date || null,
       client: vendor.client || vendor.client_id || null,
     },
-    ...context, // e.g. { reasons: [...], daysUntil }
+    ...context,
   };
 
   try {
@@ -115,16 +162,16 @@ async function sendVendorDocsEmail(vendor, context) {
         /* ignore */
       }
       console.error(
-        `[EMAIL] /vendor-docs-email responded with ${resp.status} ${resp.statusText}. Body: ${text}`
+        `[${ctx.name}][EMAIL] /vendor-docs-email responded with ${resp.status} ${resp.statusText}. Body: ${text}`
       );
     } else {
       console.log(
-        `[EMAIL] Called /vendor-docs-email for vendor "${vendor.name}" (id: ${vendor.id})`
+        `[${ctx.name}][EMAIL] Called /vendor-docs-email for vendor "${vendor.name}" (id: ${vendor.id})`
       );
     }
   } catch (err) {
     console.error(
-      `[EMAIL] Failed to call /vendor-docs-email for vendor "${vendor.name}" (id: ${vendor.id}):`,
+      `[${ctx.name}][EMAIL] Failed to call /vendor-docs-email for vendor "${vendor.name}" (id: ${vendor.id}):`,
       err
     );
   }
@@ -146,16 +193,18 @@ function diffInDays(target, base) {
 
 /**
  * Core routine: checks facility_documents and updates flags.
- * Returns { totalDocs, updatedCount }.
+ * Instance-aware via ctx.
  */
-async function checkFacilityDocuments() {
+async function checkFacilityDocuments(ctx) {
   const COLLECTION_NAME = "facility_documents";
+  const { pb } = ctx;
+  pb.autoCancellation(false);
 
-  // Load all docs that have an expire_date
   const docs = await pb.collection(COLLECTION_NAME).getFullList({
-    filter: `expire_date != "" && archived=false && send_reminder=true`,
+    filter: `expire_date != "" && archived=false && reminder_sent=true`,
     sort: "expire_date",
   });
+  console.log("Docs processing", docs.length);
 
   const now = new Date();
   let updatedCount = 0;
@@ -177,8 +226,7 @@ async function checkFacilityDocuments() {
       const reminderIsOldEnough = !reminderDate || reminderDate <= sevenDaysAgo;
 
       if (reminderIsOldEnough) {
-        // Call the real email/mini-console endpoint
-        await sendExpiryEmail(doc, {
+        await sendExpiryEmail(ctx, doc, {
           reason: "expires_soon",
           daysUntil,
         });
@@ -187,12 +235,10 @@ async function checkFacilityDocuments() {
         updates.reminder_sent = true;
       }
 
-      // in 60-day window ⇒ expires_soon true
       if (!doc.expires_soon) {
         updates.expires_soon = true;
       }
 
-      // if somehow already past in same run, mark expired (guard)
       if (daysUntil < 0 && !doc.expired) {
         updates.expired = true;
       }
@@ -223,7 +269,7 @@ async function checkFacilityDocuments() {
       await pb.collection(COLLECTION_NAME).update(doc.id, updates);
       updatedCount++;
       console.log(
-        `Updated document "${doc.name}" (id: ${doc.id}) with:`,
+        `[${ctx.name}] Updated document "${doc.name}" (id: ${doc.id}) with:`,
         updates
       );
     }
@@ -233,19 +279,11 @@ async function checkFacilityDocuments() {
 }
 
 /**
- * Core routine for checking service_company vendor documents.
- *
- * Rules:
- *  1) w9 is required (no expiry).
- *  2) coi is required and has a coi_exp_date.
- *     - If coi_exp_date is 30 days or less in the future, or in the past,
- *       send an email.
- *  3) If any requirement is not met, email service_company.email.
- *
- * Returns { totalVendors, emailedCount }.
+ * Core routine for checking service_company vendor documents (instance-aware).
  */
-async function checkVendorDocuments() {
+async function checkVendorDocuments(ctx) {
   const COLLECTION_NAME = "service_company";
+  const { pb } = ctx;
 
   const vendors = await pb.collection(COLLECTION_NAME).getFullList();
 
@@ -272,7 +310,6 @@ async function checkVendorDocuments() {
         if (Number.isNaN(exp.getTime())) {
           reasons.push("invalid_coi_date");
         } else {
-          // future = positive, past = negative
           daysUntil = diffInDays(exp, now);
           if (daysUntil < 0) {
             reasons.push("coi_expired");
@@ -283,12 +320,11 @@ async function checkVendorDocuments() {
       }
     }
 
-    // Fully compliant → no email
     if (reasons.length === 0) continue;
 
     if (!vendor.email) {
       console.warn(
-        `Vendor "${vendor.name}" (id: ${vendor.id}) has doc issues but no email on file.`
+        `[${ctx.name}] Vendor "${vendor.name}" (id: ${vendor.id}) has doc issues but no email on file.`
       );
       continue;
     }
@@ -298,20 +334,15 @@ async function checkVendorDocuments() {
     let shouldSend = false;
 
     if (!alreadySent) {
-      // No previous reminder → send now
       shouldSend = true;
     } else {
-      // Has a previous reminder → only send again if reminder_date is > 7 days ago
       if (!vendor.reminder_date) {
-        // Flag set but no date → treat as "send again"
         shouldSend = true;
       } else {
         const lastReminder = new Date(vendor.reminder_date);
         if (Number.isNaN(lastReminder.getTime())) {
-          // Invalid date → send again
           shouldSend = true;
         } else {
-          // diffInDays(target, base) – how many days since last reminder
           const daysSinceLast = diffInDays(now, lastReminder);
           if (daysSinceLast > 7) {
             shouldSend = true;
@@ -321,15 +352,12 @@ async function checkVendorDocuments() {
     }
 
     if (!shouldSend) {
-      // Still within 1-week cooldown window
       continue;
     }
 
-    // Send the reminder email
-    await sendVendorDocsEmail(vendor, { reasons, daysUntil });
+    await sendVendorDocsEmail(ctx, vendor, { reasons, daysUntil });
     emailedCount++;
 
-    // Update reminder flags
     try {
       await pb.collection(COLLECTION_NAME).update(vendor.id, {
         reminder_sent: true,
@@ -337,7 +365,7 @@ async function checkVendorDocuments() {
       });
     } catch (e) {
       console.error(
-        `Failed to update reminder flags for vendor "${vendor.name}" (id: ${vendor.id}):`,
+        `[${ctx.name}] Failed to update reminder flags for vendor "${vendor.name}" (id: ${vendor.id}):`,
         e
       );
     }
@@ -347,42 +375,53 @@ async function checkVendorDocuments() {
 }
 
 /**
- * Scheduler: run both checkers once at startup, then every 24 hours.
+ * Run checks for a single instance
  */
-async function runAllChecks() {
+async function runChecksForInstance(ctx) {
   console.log(
-    `\n[RUN] Starting document checks at ${new Date().toISOString()}`
+    `\n[RUN][${
+      ctx.name
+    }] Starting document checks at ${new Date().toISOString()}`
   );
 
   try {
-    const facResult = await checkFacilityDocuments();
+    const facResult = await checkFacilityDocuments(ctx);
     console.log(
-      `[RESULT] Facility docs: total=${facResult.totalDocs}, updated=${facResult.updatedCount}`
+      `[RESULT][${ctx.name}] Facility docs: total=${facResult.totalDocs}, updated=${facResult.updatedCount}`
     );
   } catch (err) {
-    console.error("[ERROR] checkFacilityDocuments failed:", err);
+    console.error(`[ERROR][${ctx.name}] checkFacilityDocuments failed:`, err);
   }
 
   try {
-    const vendorResult = await checkVendorDocuments();
+    const vendorResult = await checkVendorDocuments(ctx);
     console.log(
-      `[RESULT] Vendor docs: total=${vendorResult.totalVendors}, emailed=${vendorResult.emailedCount}`
+      `[RESULT][${ctx.name}] Vendor docs: total=${vendorResult.totalVendors}, emailed=${vendorResult.emailedCount}`
     );
   } catch (err) {
-    console.error("[ERROR] checkVendorDocuments failed:", err);
+    console.error(`[ERROR][${ctx.name}] checkVendorDocuments failed:`, err);
   }
 
-  console.log(`[RUN] Finished checks at ${new Date().toISOString()}\n`);
+  console.log(
+    `[RUN][${ctx.name}] Finished checks at ${new Date().toISOString()}\n`
+  );
+}
+
+/**
+ * Scheduler: run for all instances once at startup, then every 24 hours.
+ */
+async function runAllChecks() {
+  for (const ctx of INSTANCE_CONTEXTS) {
+    console.log("Checking docs for", ctx.baseUrl);
+    await runChecksForInstance(ctx);
+  }
 }
 
 const INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-// Immediately run once, then schedule every 24 hours
 (async () => {
   await runAllChecks();
 
-  // If you prefer to trigger via external cron and exit afterward,
-  // comment out the setInterval below.
   setInterval(() => {
     runAllChecks().catch((err) => {
       console.error("[FATAL] Unhandled error in scheduled run:", err);
