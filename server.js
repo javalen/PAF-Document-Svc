@@ -279,6 +279,81 @@ async function checkFacilityDocuments(ctx) {
 }
 
 /**
+ * Core routine: checks system_documents and updates flags.
+ * Instance-aware via ctx.
+ */
+async function checkSystemDocuments(ctx) {
+  const COLLECTION_NAME = "system_documents";
+  const { pb } = ctx;
+  pb.autoCancellation(false);
+
+  const docs = await pb.collection(COLLECTION_NAME).getFullList({
+    filter: `expire_date != "" && archived=false`,
+    sort: "expire_date",
+  });
+  console.log("System Docs processing", docs.length);
+
+  const now = new Date();
+  let updatedCount = 0;
+
+  for (const doc of docs) {
+    const updates = {};
+
+    if (!doc.expire_date) continue;
+
+    const expDate = new Date(doc.expire_date);
+    const daysUntil = diffInDays(expDate, now); // future = positive, past = negative
+
+    const reminderDate = doc.reminder_date ? new Date(doc.reminder_date) : null;
+    const sevenDaysAgo = new Date(now);
+    sevenDaysAgo.setDate(now.getDate() - 7);
+
+    // --- Expiration within next 60 days (0–60) ---
+    if (daysUntil >= 0 && daysUntil <= 60) {
+      const reminderIsOldEnough = !reminderDate || reminderDate <= sevenDaysAgo;
+
+      if (reminderIsOldEnough) {
+        updates.reminder_sent = true;
+      }
+
+      if (!doc.expires_soon) {
+        updates.expires_soon = true;
+      }
+
+      if (daysUntil < 0 && !doc.expired) {
+        updates.expired = true;
+      }
+    }
+    // --- Expiration in the past ---
+    else if (daysUntil < 0) {
+      if (!doc.expired) {
+        updates.expired = true;
+      }
+      if (doc.expires_soon) {
+        updates.expires_soon = false;
+      }
+    }
+    // --- Expiration NOT within 60 days (> 60 days out) ---
+    else if (daysUntil > 60) {
+      if (doc.expires_soon) {
+        updates.expires_soon = false;
+      }
+    }
+
+    if (Object.keys(updates).length > 0) {
+      await pb.collection(COLLECTION_NAME).update(doc.id, updates);
+      updatedCount++;
+      console.log(
+        `[${ctx.name}] Updated document "${doc.name}" (id: ${doc.id}) with:`,
+        updates
+      );
+    }
+  }
+
+  return { totalDocs: docs.length, updatedCount };
+}
+
+/**
  * Core routine for checking service_company vendor documents (instance-aware).
  */
 async function checkVendorDocuments(ctx) {
@@ -391,6 +466,15 @@ async function runChecksForInstance(ctx) {
     );
   } catch (err) {
     console.error(`[ERROR][${ctx.name}] checkFacilityDocuments failed:`, err);
+  }
+
+  try {
+    const facResult = await checkSystemDocuments(ctx);
+    console.log(
+      `[RESULT][${ctx.name}] System docs: total=${facResult.totalDocs}, updated=${facResult.updatedCount}`
+    );
+  } catch (err) {
+    console.error(`[ERROR][${ctx.name}] checkSystemDocuments failed:`, err);
   }
 
   try {
