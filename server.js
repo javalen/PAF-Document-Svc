@@ -1,3 +1,8 @@
+// server.js (DROP-IN)
+// ✅ Fixes "Missing or invalid auth collection context" by using admin auth
+// ✅ One PB client per instance; admin auth cached per instance
+// ✅ Multi-instance env support preserved
+
 import PocketBase from "pocketbase";
 import "dotenv/config";
 
@@ -13,6 +18,9 @@ import "dotenv/config";
  *      POCKET_BASE_URL_1, EMAIL_HOST_1
  *      POCKET_BASE_URL_2, EMAIL_HOST_2
  *      ...
+ *
+ * Auth:
+ *  - RGN_USER / RGN_PASS must be PocketBase admin/superuser credentials
  */
 
 function loadInstancesFromEnv() {
@@ -75,6 +83,56 @@ const INSTANCE_CONTEXTS = INSTANCE_CONFIGS.map((cfg) => {
 });
 
 /**
+ * ✅ Admin auth helper (NOT collection auth)
+ * PocketBase only allows authWithPassword() on AUTH collections.
+ * For server/cron jobs, use adminAuthWithPassword() once, then query/update any collection.
+ */
+// ✅ Admin auth helper (version-safe)
+async function ensureAdminAuth(ctx) {
+  const { pb, name } = ctx;
+
+  // already authenticated
+  if (pb?.authStore?.isValid) return;
+
+  const email = process.env.RGN_USER;
+  const pass = process.env.RGN_PASS;
+
+  if (!email || !pass) {
+    throw new Error(
+      `[${name}] Missing RGN_USER / RGN_PASS env vars (PocketBase admin credentials required).`
+    );
+  }
+
+  // ---- PocketBase JS SDK variations ----
+  // Newer SDK: pb.admins.authWithPassword(email, pass)
+  if (pb?.admins?.authWithPassword) {
+    await pb.admins.authWithPassword(email, pass);
+    return;
+  }
+
+  // Some SDKs: pb.adminAuthWithPassword(email, pass)
+  if (pb?.adminAuthWithPassword) {
+    await pb.adminAuthWithPassword(email, pass);
+    return;
+  }
+
+  // Fallback: authenticate against the admin auth collection directly
+  // (commonly "_superusers" in newer PocketBase)
+  try {
+    await pb.collection("_superusers").authWithPassword(email, pass);
+    return;
+  } catch (e) {
+    // If your PB uses a different admin auth collection name, this will fail.
+    // At that point we want a clear error.
+    throw new Error(
+      `[${name}] Could not admin-auth with this PocketBase SDK. ` +
+        `Tried pb.admins.authWithPassword, pb.adminAuthWithPassword, and _superusers auth. ` +
+        `Original: ${e?.message || e}`
+    );
+  }
+}
+
+/**
  * Email service: call external /update-document endpoint
  * (instance-aware via ctx)
  */
@@ -96,9 +154,7 @@ async function sendExpiryEmail(ctx, doc, context) {
   try {
     const resp = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
 
@@ -148,9 +204,7 @@ async function sendVendorDocsEmail(ctx, vendor, context) {
   try {
     const resp = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
 
@@ -200,22 +254,25 @@ async function checkFacilityDocuments(ctx) {
   const { pb } = ctx;
   pb.autoCancellation(false);
 
+  // ✅ FIX: Admin auth (not collection auth)
+  await ensureAdminAuth(ctx);
+
   const docs = await pb.collection(COLLECTION_NAME).getFullList({
-    filter: `expire_date != "" && archived=false && reminder_sent=true`,
+    filter: `expire_date != "" && archived=false`,
     sort: "expire_date",
   });
-  console.log("Docs processing", docs.length);
+
+  console.log(`[${ctx.name}] Docs processing`, docs.length);
 
   const now = new Date();
   let updatedCount = 0;
 
   for (const doc of docs) {
     const updates = {};
-
     if (!doc.expire_date) continue;
 
     const expDate = new Date(doc.expire_date);
-    const daysUntil = diffInDays(expDate, now); // future = positive, past = negative
+    const daysUntil = diffInDays(expDate, now);
 
     const reminderDate = doc.reminder_date ? new Date(doc.reminder_date) : null;
     const sevenDaysAgo = new Date(now);
@@ -226,43 +283,26 @@ async function checkFacilityDocuments(ctx) {
       const reminderIsOldEnough = !reminderDate || reminderDate <= sevenDaysAgo;
 
       if (reminderIsOldEnough) {
-        await sendExpiryEmail(ctx, doc, {
-          reason: "expires_soon",
-          daysUntil,
-        });
-
+        await sendExpiryEmail(ctx, doc, { reason: "expires_soon", daysUntil });
         updates.reminder_date = now.toISOString();
         updates.reminder_sent = true;
       }
 
-      if (!doc.expires_soon) {
-        updates.expires_soon = true;
-      }
+      if (!doc.expires_soon) updates.expires_soon = true;
 
-      if (daysUntil < 0 && !doc.expired) {
-        updates.expired = true;
-      }
+      // NOTE: this block never triggers because daysUntil >= 0 here, but kept for parity
+      if (daysUntil < 0 && !doc.expired) updates.expired = true;
     }
     // --- Expiration in the past ---
     else if (daysUntil < 0) {
-      if (!doc.expired) {
-        updates.expired = true;
-      }
-      if (doc.expires_soon) {
-        updates.expires_soon = false;
-      }
+      if (!doc.expired) updates.expired = true;
+      if (doc.expires_soon) updates.expires_soon = false;
     }
     // --- Expiration NOT within 60 days (> 60 days out) ---
     else if (daysUntil > 60) {
-      if (doc.expires_soon) {
-        updates.expires_soon = false;
-      }
-      if (doc.reminder_sent) {
-        updates.reminder_sent = false;
-      }
-      if (doc.reminder_date) {
-        updates.reminder_date = null;
-      }
+      if (doc.expires_soon) updates.expires_soon = false;
+      if (doc.reminder_sent) updates.reminder_sent = false;
+      if (doc.reminder_date) updates.reminder_date = null;
     }
 
     if (Object.keys(updates).length > 0) {
@@ -287,57 +327,43 @@ async function checkSystemDocuments(ctx) {
   const { pb } = ctx;
   pb.autoCancellation(false);
 
+  // ✅ FIX: Admin auth (not collection auth)
+  await ensureAdminAuth(ctx);
+
   const docs = await pb.collection(COLLECTION_NAME).getFullList({
     filter: `expire_date != "" && archived=false`,
     sort: "expire_date",
   });
-  console.log("System Docs processing", docs.length);
+
+  console.log(`[${ctx.name}] System Docs processing`, docs.length);
 
   const now = new Date();
   let updatedCount = 0;
 
   for (const doc of docs) {
     const updates = {};
-
     if (!doc.expire_date) continue;
 
     const expDate = new Date(doc.expire_date);
-    const daysUntil = diffInDays(expDate, now); // future = positive, past = negative
+    const daysUntil = diffInDays(expDate, now);
 
     const reminderDate = doc.reminder_date ? new Date(doc.reminder_date) : null;
     const sevenDaysAgo = new Date(now);
     sevenDaysAgo.setDate(now.getDate() - 7);
 
-    // --- Expiration within next 60 days (0–60) ---
     if (daysUntil >= 0 && daysUntil <= 60) {
       const reminderIsOldEnough = !reminderDate || reminderDate <= sevenDaysAgo;
 
-      if (reminderIsOldEnough) {
-        updates.reminder_sent = true;
-      }
+      if (reminderIsOldEnough) updates.reminder_sent = true;
+      if (!doc.expires_soon) updates.expires_soon = true;
 
-      if (!doc.expires_soon) {
-        updates.expires_soon = true;
-      }
-
-      if (daysUntil < 0 && !doc.expired) {
-        updates.expired = true;
-      }
-    }
-    // --- Expiration in the past ---
-    else if (daysUntil < 0) {
-      if (!doc.expired) {
-        updates.expired = true;
-      }
-      if (doc.expires_soon) {
-        updates.expires_soon = false;
-      }
-    }
-    // --- Expiration NOT within 60 days (> 60 days out) ---
-    else if (daysUntil > 60) {
-      if (doc.expires_soon) {
-        updates.expires_soon = false;
-      }
+      // NOTE: same parity note as above
+      if (daysUntil < 0 && !doc.expired) updates.expired = true;
+    } else if (daysUntil < 0) {
+      if (!doc.expired) updates.expired = true;
+      if (doc.expires_soon) updates.expires_soon = false;
+    } else if (daysUntil > 60) {
+      if (doc.expires_soon) updates.expires_soon = false;
     }
 
     if (Object.keys(updates).length > 0) {
@@ -360,6 +386,9 @@ async function checkVendorDocuments(ctx) {
   const COLLECTION_NAME = "service_company";
   const { pb } = ctx;
 
+  // ✅ FIX: Admin auth (not collection auth)
+  await ensureAdminAuth(ctx);
+
   const vendors = await pb.collection(COLLECTION_NAME).getFullList();
 
   const now = new Date();
@@ -369,12 +398,8 @@ async function checkVendorDocuments(ctx) {
     const reasons = [];
     let daysUntil = null;
 
-    // 1) W9 required
-    if (!vendor.w9) {
-      reasons.push("missing_w9");
-    }
+    if (!vendor.w9) reasons.push("missing_w9");
 
-    // 2) COI required + expiry
     if (!vendor.coi) {
       reasons.push("missing_coi");
     } else {
@@ -386,11 +411,8 @@ async function checkVendorDocuments(ctx) {
           reasons.push("invalid_coi_date");
         } else {
           daysUntil = diffInDays(exp, now);
-          if (daysUntil < 0) {
-            reasons.push("coi_expired");
-          } else if (daysUntil <= 30) {
-            reasons.push("coi_expires_soon");
-          }
+          if (daysUntil < 0) reasons.push("coi_expired");
+          else if (daysUntil <= 30) reasons.push("coi_expires_soon");
         }
       }
     }
@@ -419,16 +441,12 @@ async function checkVendorDocuments(ctx) {
           shouldSend = true;
         } else {
           const daysSinceLast = diffInDays(now, lastReminder);
-          if (daysSinceLast > 7) {
-            shouldSend = true;
-          }
+          if (daysSinceLast > 7) shouldSend = true;
         }
       }
     }
 
-    if (!shouldSend) {
-      continue;
-    }
+    if (!shouldSend) continue;
 
     await sendVendorDocsEmail(ctx, vendor, { reasons, daysUntil });
     emailedCount++;
@@ -469,9 +487,9 @@ async function runChecksForInstance(ctx) {
   }
 
   try {
-    const facResult = await checkSystemDocuments(ctx);
+    const sysResult = await checkSystemDocuments(ctx);
     console.log(
-      `[RESULT][${ctx.name}] System docs: total=${facResult.totalDocs}, updated=${facResult.updatedCount}`
+      `[RESULT][${ctx.name}] System docs: total=${sysResult.totalDocs}, updated=${sysResult.updatedCount}`
     );
   } catch (err) {
     console.error(`[ERROR][${ctx.name}] checkSystemDocuments failed:`, err);
