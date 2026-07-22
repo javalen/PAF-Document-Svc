@@ -12,11 +12,10 @@ import "dotenv/config";
  * Supported env patterns:
  *  - Single instance:
  *      POCKET_BASE_URL
- *      EMAIL_HOST
  *
  *  - Multiple instances:
- *      POCKET_BASE_URL_1, EMAIL_HOST_1
- *      POCKET_BASE_URL_2, EMAIL_HOST_2
+ *      POCKET_BASE_URL_1
+ *      POCKET_BASE_URL_2
  *      ...
  *
  * Auth:
@@ -27,37 +26,27 @@ function loadInstancesFromEnv() {
   const instances = [];
 
   // Base (non-suffixed) pair
-  if (process.env.POCKET_BASE_URL && process.env.EMAIL_HOST) {
+  if (process.env.POCKET_BASE_URL) {
     instances.push({
       name: "default",
       baseUrl: process.env.POCKET_BASE_URL,
-      emailHost: process.env.EMAIL_HOST,
     });
   }
 
-  // Numbered pairs POCKET_BASE_URL_1 / EMAIL_HOST_1, etc.
+  // Numbered PocketBase instances
   for (let i = 1; i <= 20; i++) {
     const url = process.env[`POCKET_BASE_URL_${i}`];
-    const host = process.env[`EMAIL_HOST_${i}`];
-    if (!url && !host) continue; // nothing defined for this index
-
-    if (!url || !host) {
-      console.warn(
-        `Skipping instance ${i} because one of POCKET_BASE_URL_${i} or EMAIL_HOST_${i} is missing.`
-      );
-      continue;
-    }
+    if (!url) continue;
 
     instances.push({
       name: `instance_${i}`,
       baseUrl: url,
-      emailHost: host,
     });
   }
 
   if (instances.length === 0) {
     console.error(
-      "No PocketBase instances configured. Define at least POCKET_BASE_URL and EMAIL_HOST, or numbered pairs."
+      "No PocketBase instances configured. Define POCKET_BASE_URL or at least one numbered POCKET_BASE_URL_n value."
     );
     process.exit(1);
   }
@@ -66,6 +55,10 @@ function loadInstancesFromEnv() {
 }
 
 const INSTANCE_CONFIGS = loadInstancesFromEnv();
+const EMAIL_HOST = (process.env.EMAIL_HOST || "https://email.predictaf.com").replace(
+  /\/+$/,
+  ""
+);
 
 /**
  * Build runtime contexts: one PocketBase client per instance.
@@ -77,7 +70,7 @@ const INSTANCE_CONTEXTS = INSTANCE_CONFIGS.map((cfg) => {
   return {
     name: cfg.name,
     baseUrl: cfg.baseUrl,
-    emailHost: cfg.emailHost,
+    emailHost: EMAIL_HOST,
     pb,
   };
 });
@@ -141,6 +134,7 @@ async function sendExpiryEmail(ctx, doc, context) {
   const url = `${baseUrl}/update-document`;
 
   const payload = {
+    pbHost: ctx.baseUrl,
     record: {
       id: doc.id,
       name: doc.name,
@@ -189,6 +183,7 @@ async function sendVendorDocsEmail(ctx, vendor, context) {
   const url = `${baseUrl}/vendor-docs-email`;
 
   const payload = {
+    pbHost: ctx.baseUrl,
     record: {
       id: vendor.id,
       name: vendor.name,
