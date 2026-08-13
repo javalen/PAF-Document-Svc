@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "runs": [
+    {
+      "id": "2d60bc17-d856-4e58-b43b-8ed2075d974e",
+      "trigger_id": "internal-daily:2026-08-11",
+      "source": "internal-startup",
+      "status": "completed",
+      "requested_at": "2026-08-11T04:22:39.140Z",
+      "started_at": "2026-08-11T04:22:39.201Z",
+      "completed_at": "2026-08-11T04:22:41.968Z",
+      "duration_ms": 2767,
+      "worker_id": "41712-087b7d34-5a53-4634-8372-f734a944004d",
+      "lease_expires_at": null,
+      "counts": {
+        "instances_requested": 5,
+        "instances_completed": 5,
+        "instances_partial": 0,
+        "instances_failed": 0,
+        "facility_documents_scanned": 1,
+        "facility_documents_updated": 0,
+        "system_documents_scanned": 0,
+        "system_documents_updated": 0,
+        "vendors_scanned": 21,
+        "vendor_emails_sent": 0
+      },
+      "errors": []
+    }
+  ]
+}
